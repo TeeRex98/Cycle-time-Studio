@@ -218,11 +218,7 @@ var state = {
   models: [],
   records: [],
   timerModelId: null,
-  activeStepId: null,
-  timerOn: false,
-  paused: false,
-  pausedAccum: 0,
-  runningSince: null,
+  timers: {},
   sessionStart: Date.now(),
   lastReading: null,
   manualStepId: null,
@@ -235,18 +231,24 @@ var state = {
   reportDateFrom: "",
   reportDateTo: "",
   modelsSelId: null,
-  modelsSelStepId: null
+  modelsSelStepId: null,
+  expandedSteps: {}
 };
 var tickTimer = null;
+
+function getStepReps(step, model){
+  if (step && step.reps !== undefined && step.reps !== null) return step.reps;
+  return (model && model.targetSamples) || 5;
+}
 
 function seedModels(){
   return [{
     id: uid(), name: "Model A", code: "MDL-A", targetSamples: 5,
     steps: [
-      { id: uid(), stage: "Chassis Assembly", station: "Station 1", name: "Frame prep", target: 22 },
-      { id: uid(), stage: "Sub-Assembly", station: "Station 2", name: "Sub-assembly", target: 35 },
-      { id: uid(), stage: "Final Assembly", station: "Station 3", name: "Final assembly", target: 28 },
-      { id: uid(), stage: "Quality Check", station: "QC", name: "Inspection", target: 15 }
+      { id: uid(), stage: "Chassis Assembly", station: "Station 1", name: "Frame prep", target: 22, reps: 5 },
+      { id: uid(), stage: "Sub-Assembly", station: "Station 2", name: "Sub-assembly", target: 35, reps: 5 },
+      { id: uid(), stage: "Final Assembly", station: "Station 3", name: "Final assembly", target: 28, reps: 5 },
+      { id: uid(), stage: "Quality Check", station: "QC", name: "Inspection", target: 15, reps: 5 }
     ]
   }];
 }
@@ -258,7 +260,6 @@ function init(){
   state.records = r || [];
   if (!m || !m.length) lsSet(LS_MODELS, state.models);
   state.timerModelId = state.models[0] ? state.models[0].id : null;
-  state.activeStepId = (state.models[0] && state.models[0].steps[0]) ? state.models[0].steps[0].id : null;
   state.modelsSelId = state.models[0] ? state.models[0].id : null;
   state.modelsSelStepId = (state.models[0] && state.models[0].steps[0]) ? state.models[0].steps[0].id : null;
   render();
@@ -291,58 +292,58 @@ function showToast(text, kind){
 /* ---------------------------------------------------------------------- */
 function getTimerModel(){ return state.models.find(function(m){ return m.id === state.timerModelId; }) || null; }
 function getTimerSteps(){ var m = getTimerModel(); return m ? m.steps : []; }
-function getCurStep(){ var steps = getTimerSteps(); return steps.find(function(s){ return s.id === state.activeStepId; }) || null; }
 
-function stepMs(){
-  if (!state.timerOn) return state.pausedAccum;
-  return state.paused ? state.pausedAccum : state.pausedAccum + (Date.now() - state.runningSince);
+function timerEntry(stepId){ return state.timers[stepId] || null; }
+function stepMsFor(stepId){
+  var t = state.timers[stepId];
+  if (!t) return 0;
+  return t.paused ? t.pausedAccum : t.pausedAccum + (Date.now() - t.runningSince);
 }
+function anyTimerRunning(){
+  return Object.keys(state.timers).some(function(k){ return !state.timers[k].paused; });
+}
+function anyTimerActive(){ return Object.keys(state.timers).length > 0; }
 
 function clearTick(){ if (tickTimer){ clearInterval(tickTimer); tickTimer = null; } }
 function startTick(){
   clearTick();
   tickTimer = setInterval(function(){
-    var el = document.getElementById("cts-clock");
-    if (!el){ clearTick(); return; }
-    var ms = stepMs();
-    el.textContent = fmtClock(ms);
-    var cur = getCurStep();
-    var over = cur && cur.target ? (ms/1000 > cur.target) : false;
-    el.style.color = over ? "#f2b45a" : "var(--lcd-fg)";
-  }, 60);
+    var steps = getTimerSteps();
+    var stale = false;
+    Object.keys(state.timers).forEach(function(stepId){
+      var t = state.timers[stepId];
+      if (!t || t.paused) return;
+      var el = document.getElementById("clock-"+stepId);
+      if (!el){ stale = true; return; }
+      var ms = stepMsFor(stepId);
+      el.textContent = fmtClock(ms);
+      var step = steps.find(function(s){ return s.id === stepId; });
+      var over = step && step.target ? (ms/1000 > step.target) : false;
+      el.style.color = over ? "#f2b45a" : "var(--lcd-fg)";
+    });
+    if (stale) renderTab();
+  }, 200);
 }
 
 window.timerSelectModel = function(id){
+  if (anyTimerActive()){ showToast("Stop or discard running timers before switching models", "err"); return; }
   state.timerModelId = id;
-  var m = state.models.find(function(x){ return x.id === id; });
-  state.activeStepId = (m && m.steps[0]) ? m.steps[0].id : null;
   state.sessionStart = Date.now();
   state.lastReading = null;
   renderTab();
 };
 
-window.selectStep = function(stepId){
-  if (state.timerOn) return; // don't switch mid-timing
-  state.activeStepId = stepId;
+window.startStep = function(stepId){
+  state.timers[stepId] = { pausedAccum: 0, runningSince: Date.now(), paused: false };
   renderTab();
 };
 
-window.startStep = function(){
-  var steps = getTimerSteps();
-  if (!steps.length){ showToast("Add at least one step to this model first", "err"); return; }
-  if (!state.activeStepId) state.activeStepId = steps[0].id;
-  state.pausedAccum = 0;
-  state.runningSince = Date.now();
-  state.timerOn = true;
-  state.paused = false;
-  renderTab();
-};
-
-window.stopAndRecordStep = function(){
+window.stopAndRecordStep = function(stepId){
   var model = getTimerModel();
-  var step = getCurStep();
+  var steps = getTimerSteps();
+  var step = steps.find(function(s){ return s.id === stepId; });
   if (!model || !step) return;
-  var durationSec = stepMs()/1000;
+  var durationSec = stepMsFor(stepId)/1000;
   var rec = {
     id: uid(), cycleId: "rep-"+uid(), modelId: model.id, modelName: model.name,
     stepId: step.id, stepName: step.name, station: step.station,
@@ -351,43 +352,32 @@ window.stopAndRecordStep = function(){
     hc: state.sessionHC, workerId: state.sessionWorker, session: state.sessionLabel, comment: state.sessionComment
   };
   persistRecords(state.records.concat([rec]));
-
-  state.timerOn = false;
-  state.paused = false;
-  state.pausedAccum = 0;
-  state.runningSince = null;
+  delete state.timers[stepId];
 
   var n = state.records.filter(function(r){
     return r.modelId === model.id && r.stepId === step.id &&
       String(r.cycleId).indexOf("manual-") !== 0 &&
       new Date(r.timestamp).getTime() >= state.sessionStart;
   }).length;
-  var target = model.targetSamples || 5;
+  var target = getStepReps(step, model);
   state.lastReading = { station: step.station, stepName: step.name, duration: durationSec, n: n, target: target };
   renderTab();
 };
 
-window.togglePause = function(){
-  if (!state.timerOn) return;
-  if (state.paused){ state.runningSince = Date.now(); state.paused = false; }
-  else { state.pausedAccum = stepMs(); state.paused = true; }
+window.togglePause = function(stepId){
+  var t = state.timers[stepId];
+  if (!t) return;
+  if (t.paused){ t.runningSince = Date.now(); t.paused = false; }
+  else { t.pausedAccum = stepMsFor(stepId); t.paused = true; }
   renderTab();
 };
 
-window.discardTiming = function(){
-  state.timerOn = false; state.paused = false; state.pausedAccum = 0; state.runningSince = null;
+window.discardTiming = function(stepId){
+  delete state.timers[stepId];
   renderTab();
 };
 
 window.resetProgress = function(){ state.sessionStart = Date.now(); renderTab(); };
-
-window.updateModelTargetSamples = function(val){
-  var model = getTimerModel();
-  if (!model) return;
-  var v = Math.max(1, parseInt(val,10) || 1);
-  persistModels(state.models.map(function(m){ return m.id === model.id ? Object.assign({}, m, { targetSamples: v }) : m; }));
-  renderTab();
-};
 
 window.manualSelectStep = function(id){ state.manualStepId = id; };
 window.manualSubmit = function(){
@@ -407,6 +397,32 @@ window.manualSubmit = function(){
   };
   persistRecords(state.records.concat([rec]));
   showToast("Manual entry added");
+  renderTab();
+};
+
+window.timerUpdateStepField = function(stepId, field, val){
+  var model = getTimerModel();
+  if (!model) return;
+  updateStepFieldForModel(model.id, stepId, field, val);
+  renderTab();
+};
+window.timerAddStep = function(){
+  var model = getTimerModel();
+  if (!model) return;
+  var step = { id: uid(), stage: "", station: "Station", name: "New step", target: 0, reps: model.targetSamples || 5 };
+  persistModels(state.models.map(function(m){ return m.id === model.id ? Object.assign({}, m, { steps: m.steps.concat([step]) }) : m; }));
+  renderTab();
+};
+window.timerInsertStepAt = function(index){
+  var model = getTimerModel();
+  if (!model) return;
+  var step = { id: uid(), stage: "", station: "Station", name: "New step", target: 0, reps: model.targetSamples || 5 };
+  persistModels(state.models.map(function(m){
+    if (m.id !== model.id) return m;
+    var steps = m.steps.slice();
+    steps.splice(index, 0, step);
+    return Object.assign({}, m, { steps: steps });
+  }));
   renderTab();
 };
 
@@ -460,23 +476,41 @@ window.modelsSelectStep = function(stepId){ state.modelsSelStepId = stepId; rend
 window.addStep = function(){
   var sel = state.models.find(function(m){ return m.id === state.modelsSelId; });
   if (!sel) return;
-  var step = { id: uid(), stage: "", station: "Station", name: "New step", target: 0 };
+  var step = { id: uid(), stage: "", station: "Station", name: "New step", target: 0, reps: sel.targetSamples || 5 };
   persistModels(state.models.map(function(m){ return m.id === sel.id ? Object.assign({}, m, { steps: m.steps.concat([step]) }) : m; }));
   state.modelsSelStepId = step.id;
   renderTab();
 };
-window.updateStepField = function(stepId, field, val){
+window.modelsInsertStepAt = function(index){
   var sel = state.models.find(function(m){ return m.id === state.modelsSelId; });
   if (!sel) return;
-  var parsed = (field === "target") ? (val === "" ? null : parseFloat(val)) : val;
+  var step = { id: uid(), stage: "", station: "Station", name: "New step", target: 0, reps: sel.targetSamples || 5 };
   persistModels(state.models.map(function(m){
     if (m.id !== sel.id) return m;
+    var steps = m.steps.slice();
+    steps.splice(index, 0, step);
+    return Object.assign({}, m, { steps: steps });
+  }));
+  state.modelsSelStepId = step.id;
+  renderTab();
+};
+function updateStepFieldForModel(modelId, stepId, field, val){
+  var parsed = (field === "target") ? (val === "" ? null : parseFloat(val))
+    : (field === "reps") ? Math.max(1, parseInt(val,10) || 1)
+    : val;
+  persistModels(state.models.map(function(m){
+    if (m.id !== modelId) return m;
     return Object.assign({}, m, { steps: m.steps.map(function(s){
       if (s.id !== stepId) return s;
       var patch = {}; patch[field] = parsed;
       return Object.assign({}, s, patch);
     }) });
   }));
+}
+window.updateStepField = function(stepId, field, val){
+  var sel = state.models.find(function(m){ return m.id === state.modelsSelId; });
+  if (!sel) return;
+  updateStepFieldForModel(sel.id, stepId, field, val);
   renderTab();
 };
 window.removeStep = function(stepId){
@@ -498,13 +532,13 @@ window.moveStep = function(idx, dir){
   renderTab();
 };
 window.downloadStepsTemplate = function(){
-  var header = ["Model","Stage","Station","Step","Order","Target (s)"];
+  var header = ["Model","Stage","Station","Step","Order","Target (s)","Reps"];
   var rows = [
-    ["Model A","Chassis Assembly","Station 1","Frame prep",1,22],
-    ["Model A","Sub-Assembly","Station 2","Sub-assembly",2,35],
-    ["Model A","Final Assembly","Station 3","Final assembly",3,28],
-    ["Model A","Quality Check","QC","Inspection",4,15],
-    ["Model B","","Station 1","Example step — replace me",1,""]
+    ["Model A","Chassis Assembly","Station 1","Frame prep",1,22,5],
+    ["Model A","Sub-Assembly","Station 2","Sub-assembly",2,35,5],
+    ["Model A","Final Assembly","Station 3","Final assembly",3,28,5],
+    ["Model A","Quality Check","QC","Inspection",4,15,5],
+    ["Model B","","Station 1","Example step — replace me",1,"",5]
   ];
   var lines = [header.join(",")];
   rows.forEach(function(r){ lines.push(r.map(csvEscape).join(",")); });
@@ -537,6 +571,10 @@ window.setReportDateFrom = function(v){ state.reportDateFrom = v; renderTab(); }
 window.setReportDateTo = function(v){ state.reportDateTo = v; renderTab(); };
 window.deleteRecord = function(id){
   persistRecords(state.records.filter(function(r){ return r.id !== id; }));
+  renderTab();
+};
+window.toggleStepReadings = function(stepId){
+  state.expandedSteps[stepId] = !state.expandedSteps[stepId];
   renderTab();
 };
 
@@ -796,11 +834,11 @@ window.exportSummaryCSV = function(){
   showToast("Summary exported (CSV)");
 };
 window.exportModelsCSV = function(){
-  var header = ["Model","Stage","Station","Step","Order","Target (s)"];
+  var header = ["Model","Stage","Station","Step","Order","Target (s)","Reps"];
   var lines = [header.join(",")];
   state.models.forEach(function(m){
     m.steps.forEach(function(s,i){
-      lines.push([m.name, s.stage||"", s.station, s.name, i+1, s.target!=null?s.target:""].map(csvEscape).join(","));
+      lines.push([m.name, s.stage||"", s.station, s.name, i+1, s.target!=null?s.target:"", getStepReps(s,m)].map(csvEscape).join(","));
     });
   });
   downloadText("cycle-time-models-"+todayStr()+".csv", lines.join("\n"));
@@ -919,7 +957,8 @@ window.handleImportModels = function(evt){
         if (!byModel[name]) byModel[name] = { id: uid(), name: name, code:"", targetSamples:5, steps:[] };
         byModel[name].steps.push({
           id: uid(), stage: (row["Stage"]||"").trim(), station: (row["Station"]||"Station").trim(), name: (row["Step"]||"Step").trim(),
-          target: row["Target (s)"] !== undefined && row["Target (s)"] !== "" ? Number(row["Target (s)"]) : null
+          target: row["Target (s)"] !== undefined && row["Target (s)"] !== "" ? Number(row["Target (s)"]) : null,
+          reps: row["Reps"] !== undefined && row["Reps"] !== "" ? Math.max(1, parseInt(row["Reps"],10)||1) : 5
         });
       });
       var list = Object.keys(byModel).map(function(k){ return byModel[k]; });
@@ -973,91 +1012,133 @@ function renderHeader(){
 }
 
 /* ---------------- Timer tab ---------------- */
+function buildInsertGap(fnName, index){
+  return '<button onclick="'+fnName+'('+index+')" title="Insert step here" '
+    + 'style="all:unset;display:flex;align-items:center;justify-content:center;cursor:pointer;height:13px;width:100%;box-sizing:border-box">'
+    + '<span style="flex:1;height:1px;background:var(--line)"></span>'
+    + '<span style="font-size:12px;line-height:1;padding:0 5px;color:#8a8578;font-weight:700">+</span>'
+    + '<span style="flex:1;height:1px;background:var(--line)"></span>'
+    + '</button>';
+}
+
 function renderTimerTab(){
   var model = getTimerModel();
   var steps = getTimerSteps();
-  var target = model ? (model.targetSamples || 5) : 5;
   var progress = model ? computeProgress(model) : {};
-  var stepsMet = steps.filter(function(s){ return (progress[s.id]||0) >= target; }).length;
+  var stepsMet = steps.filter(function(s){ return (progress[s.id]||0) >= getStepReps(s, model); }).length;
   var allMet = steps.length > 0 && stepsMet === steps.length;
-  var cur = getCurStep();
-  var overTarget = cur && cur.target ? (stepMs()/1000 > cur.target) : false;
+  var anyActive = anyTimerActive();
 
   var modelOptions = state.models.map(function(m){
     return '<option value="'+m.id+'" '+(m.id===state.timerModelId?"selected":"")+'>'+esc(m.name)+'</option>';
   }).join("");
 
-  /* left column: model picker + steps as a navigable list */
-  var stepItems = "";
-  var lastStage = null;
-  steps.forEach(function(s,i){
-    var stg = s.stage || "";
-    if (stg !== lastStage){
-      stepItems += '<div style="font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;opacity:.45;padding:7px 4px 1px">'+(stg?esc(stg):"No stage")+'</div>';
-      lastStage = stg;
-    }
-    var n = progress[s.id] || 0, met = n >= target;
-    var active = s.id === state.activeStepId;
-    var badgeFg = met ? "var(--teal-dark)" : "#8a8578";
-    var badgeBg = met ? "#e7f2ef" : "rgba(0,0,0,.06)";
-    stepItems += '<button class="model-list-btn" data-active="'+(active?"1":"0")+'" '+(state.timerOn?"disabled":"")+' onclick="selectStep(\''+s.id+'\')" style="align-items:flex-start">'
-      + '<span class="mono" style="font-size:10.5px;font-weight:700;opacity:.55;flex-shrink:0;margin-top:1px">S'+(i+1)+'</span>'
-      + '<span style="white-space:normal;line-height:1.3;flex:1;text-align:left">'+esc(s.name)+'</span>'
-      + '<span class="step-badge" style="background:'+badgeBg+';color:'+badgeFg+';margin-left:6px;flex-shrink:0">'+n+'/'+target+'</span>'
-      + '</button>';
-  });
-  var stepsPane = '<div class="card" style="display:flex;flex-direction:column;gap:6px;height:fit-content;max-height:600px;overflow-y:auto">'
-    + '<div style="font-size:12px;font-weight:600;opacity:.7;text-transform:uppercase;letter-spacing:.04em;padding:0 2px">Model</div>'
-    + '<select '+(state.timerOn?"disabled":"")+' onchange="timerSelectModel(this.value)" style="width:100%">'
+  /* left column: model picker, session settings, progress */
+  var left = '<div class="card" style="display:flex;flex-direction:column;gap:12px;height:fit-content">'
+    + '<div><div class="field-label" style="margin-bottom:4px">Model</div>'
+    + '<select '+(anyActive?"disabled":"")+' onchange="timerSelectModel(this.value)" style="width:100%">'
     + (state.models.length ? modelOptions : '<option>No models yet</option>') + '</select>'
-    + '<div style="font-size:12px;font-weight:600;opacity:.7;text-transform:uppercase;letter-spacing:.04em;padding:10px 2px 0">Steps</div>'
-    + (steps.length ? stepItems : '<div style="font-size:12.5px;opacity:.55;padding:6px 2px">No steps yet — add some in “Models &amp; Steps”.</div>')
+    + (anyActive ? '<div style="font-size:11px;opacity:.55;margin-top:4px">Stop or discard running stations to switch models.</div>' : "")
+    + '</div>'
+    + (model ? (
+        '<div style="font-size:12px;font-weight:500;color:'+(allMet?"var(--teal-dark)":"#6b665b")+'">'+stepsMet+'/'+steps.length+' steps have the reps they need'+(allMet?" — stage complete ✓":"")+'</div>'
+        + '<button class="btn-link" style="align-self:flex-start" onclick="resetProgress()">Reset progress</button>'
+      ) : "")
+    + '<div style="border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:8px">'
+    + '<div class="field-label">Session details</div>'
+    + '<div class="row"><label class="field-label" style="width:50px">HC</label><input type="number" min="1" step="1" value="'+state.sessionHC+'" onchange="setSessionField(\'sessionHC\',this.value)" style="width:60px" /></div>'
+    + '<div class="row"><label class="field-label" style="width:50px">Worker</label><input type="text" value="'+esc(state.sessionWorker)+'" placeholder="A" onchange="setSessionField(\'sessionWorker\',this.value)" style="width:60px" /></div>'
+    + '<div class="row"><label class="field-label" style="width:50px">Session</label><input type="text" value="'+esc(state.sessionLabel)+'" placeholder="Session 1" onchange="setSessionField(\'sessionLabel\',this.value)" style="flex:1;min-width:80px" /></div>'
+    + '<div class="row"><label class="field-label" style="width:50px">Note</label><input type="text" value="'+esc(state.sessionComment)+'" placeholder="optional" onchange="setSessionField(\'sessionComment\',this.value)" style="flex:1;min-width:80px" /></div>'
+    + '</div>'
     + '</div>';
 
-  var controls = "";
-  if (!state.timerOn){
-    controls = '<button class="btn btn-primary" '+(!steps.length?"disabled":"")+' onclick="startStep()">'+ICO.play+' Start</button>';
-  } else {
-    controls = '<button class="btn btn-primary" onclick="stopAndRecordStep()">'+ICO.check+' Stop &amp; record</button>'
-      + '<button class="btn btn-outline" onclick="togglePause()">'+(state.paused?ICO.play:ICO.pause)+' '+(state.paused?"Resume":"Pause")+'</button>'
-      + '<button class="btn btn-danger" onclick="discardTiming()">'+ICO.x+' Discard</button>';
-  }
-
+  /* center: every step is its own independent stopwatch — start as many at once as you like */
   var lastReading = state.lastReading ? (
-    '<div style="font-size:12.5px;padding:9px 12px;border-radius:8px;background:#e7f2ef;color:var(--teal-dark)">'
+    '<div class="card" style="font-size:12.5px;padding:10px 12px;background:#e7f2ef;color:var(--teal-dark)">'
     + 'Recorded '+fmtSec(state.lastReading.duration)+' for '+esc(state.lastReading.station)+' — '+esc(state.lastReading.stepName)+'. '
     + state.lastReading.n+'/'+state.lastReading.target+' reading'+(state.lastReading.target===1?"":"s")+' for this step so far.'
-    + (allMet ? " All steps have reached the target for this stage." : "")
+    + (allMet ? " All steps have reached the reps needed for this stage." : "")
     + '</div>'
   ) : "";
 
-  var hint = (!state.timerOn && steps.length>0)
-    ? '<div style="font-size:11.5px;opacity:.55">Pick a station from the list on the left, then Start/Stop each time you record a reading — repeat as many times as you need on the same station. Click a different station whenever you\'re ready to move on; nothing switches automatically.</div>' : "";
+  var rows = "";
+  var lastStage = null;
+  steps.forEach(function(s,i){
+    rows += buildInsertGap("timerInsertStepAt", i);
+    var stg = s.stage || "";
+    if (stg !== lastStage){
+      rows += '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;opacity:.45;padding:10px 4px 2px">'+(stg?esc(stg):"No stage")+'</div>';
+      lastStage = stg;
+    }
+    var t = timerEntry(s.id);
+    var running = !!t;
+    var paused = running && t.paused;
+    var reps = getStepReps(s, model);
+    var n = progress[s.id] || 0, met = n >= reps;
+    var ms = running ? stepMsFor(s.id) : 0;
+    var over = running && s.target ? (ms/1000 > s.target) : false;
 
-  var mid =
-    '<div class="card" style="display:flex;flex-direction:column;gap:14px">'
-    + (model ? (
-        '<div class="row" style="background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:9px 12px">'
-        + '<label class="field-label">Readings per step</label>'
-        + '<input type="number" min="1" step="1" value="'+target+'" onchange="updateModelTargetSamples(this.value)" style="width:64px" />'
-        + '<div style="font-size:12px;font-weight:500;color:'+(allMet?"var(--teal-dark)":"#6b665b")+'">'+stepsMet+'/'+steps.length+' steps have '+target+' reading'+(target===1?"":"s")+(allMet?" — stage complete ✓":"")+'</div>'
-        + '<button class="btn-link" style="margin-left:auto" onclick="resetProgress()">Reset progress</button>'
-        + '</div>'
-      ) : "")
-    + '<div class="row" style="background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:9px 12px;flex-wrap:wrap">'
-    + '<label class="field-label">HC</label><input type="number" min="1" step="1" value="'+state.sessionHC+'" onchange="setSessionField(\'sessionHC\',this.value)" style="width:52px" />'
-    + '<label class="field-label">Worker</label><input type="text" value="'+esc(state.sessionWorker)+'" placeholder="A" onchange="setSessionField(\'sessionWorker\',this.value)" style="width:56px" />'
-    + '<label class="field-label">Session</label><input type="text" value="'+esc(state.sessionLabel)+'" placeholder="Session 1" onchange="setSessionField(\'sessionLabel\',this.value)" style="width:110px" />'
-    + '<label class="field-label">Comment</label><input type="text" value="'+esc(state.sessionComment)+'" placeholder="optional note" onchange="setSessionField(\'sessionComment\',this.value)" style="flex:1;min-width:100px" />'
+    var controls;
+    if (!running){
+      controls = '<button class="btn btn-primary" style="padding:7px 12px;font-size:12.5px" onclick="startStep(\''+s.id+'\')">'+ICO.play+' Start</button>';
+    } else {
+      controls = '<button class="btn btn-primary" style="padding:7px 12px;font-size:12.5px" onclick="stopAndRecordStep(\''+s.id+'\')">'+ICO.check+' Stop</button>'
+        + '<button class="btn btn-outline" style="padding:7px 10px;font-size:12.5px" onclick="togglePause(\''+s.id+'\')">'+(paused?ICO.play:ICO.pause)+'</button>'
+        + '<button class="btn btn-danger" style="padding:7px 8px;font-size:12.5px" onclick="discardTiming(\''+s.id+'\')">'+ICO.x+'</button>';
+    }
+
+    var sessionReadings = state.records.filter(function(r){
+      return r.modelId === model.id && r.stepId === s.id &&
+        String(r.cycleId).indexOf("manual-") !== 0 &&
+        new Date(r.timestamp).getTime() >= state.sessionStart;
+    }).sort(function(a,b){ return new Date(a.timestamp) - new Date(b.timestamp); });
+    var expanded = !!state.expandedSteps[s.id];
+
+    var toggleLine = sessionReadings.length ? (
+      '<button onclick="toggleStepReadings(\''+s.id+'\')" style="all:unset;cursor:pointer;font-size:11px;color:var(--teal-dark);font-weight:600;padding-top:2px">'
+      + (expanded ? "▾ " : "▸ ") + sessionReadings.length + " reading" + (sessionReadings.length===1?"":"s") + (expanded ? "" : " — click to review")
+      + '</button>'
+    ) : "";
+
+    var readingsChips = (expanded && sessionReadings.length) ? (
+      '<div style="display:flex;flex-wrap:wrap;gap:6px;padding-top:4px">'
+      + sessionReadings.map(function(r, idx){
+          var overR = r.target && r.duration > r.target;
+          return '<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 7px;border-radius:7px;background:var(--paper);border:1px solid var(--line);color:'+(overR?"var(--red)":"var(--ink)")+'">'
+            + (idx+1)+'. '+fmtSec(r.duration)
+            + '<button onclick="deleteRecord(\''+r.id+'\')" title="Delete this reading" style="all:unset;cursor:pointer;color:var(--red);font-weight:700;line-height:1;padding:0 2px">×</button>'
+            + '</span>';
+        }).join("")
+      + '</div>'
+    ) : "";
+
+    rows += '<div class="card" style="display:flex;flex-direction:column;gap:2px;padding:10px 12px;'
+      + (running ? (paused ? 'border-color:var(--amber)' : 'border-color:var(--teal)') : '') + '">'
+      + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+      + '<span class="mono" style="font-size:10.5px;font-weight:700;opacity:.5;flex-shrink:0">S'+(i+1)+'</span>'
+      + '<input type="text" value="'+esc(s.name)+'" '+(running?"disabled":"")+' onchange="timerUpdateStepField(\''+s.id+'\',\'name\',this.value)" style="flex:1;min-width:120px;font-weight:500" />'
+      + '<span class="step-badge" style="background:'+(met?"#e7f2ef":"rgba(0,0,0,.06)")+';color:'+(met?"var(--teal-dark)":"#8a8578")+'">'+n+'/'+reps+'</span>'
+      + '<span id="clock-'+s.id+'" class="mono" style="font-size:17px;font-weight:700;min-width:82px;text-align:right;color:'+(running?(over?"#c96a1f":"var(--teal-dark)"):"#b7b2a3")+'">'+fmtClock(ms)+'</span>'
+      + (running && paused ? '<span style="font-size:10px;font-weight:600;color:var(--amber);text-transform:uppercase">Paused</span>' : "")
+      + '<div class="row" style="gap:4px">'+controls+'</div>'
+      + '</div>'
+      + toggleLine + readingsChips
+      + '</div>';
+  });
+  if (steps.length) rows += buildInsertGap("timerInsertStepAt", steps.length);
+
+  var stepsBlock = '<div style="display:flex;flex-direction:column;gap:6px">'
+    + '<div class="row" style="justify-content:space-between">'
+    + '<div style="font-size:12px;font-weight:600;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Stations ('+steps.length+') — start as many at once as you like</div>'
+    + '<button class="btn btn-outline" style="padding:6px 10px;font-size:12px" '+(!model?"disabled":"")+' onclick="timerAddStep()">'+ICO.plus+' Add step</button>'
     + '</div>'
-    + '<div class="lcd">'
-    + '<div class="lcd-label">'+(cur ? (esc(cur.station)+" — "+esc(cur.name)+(state.timerOn?(state.paused?" (paused)":" (recording)"):"")) : "Pick a station on the left")+'</div>'
-    + '<div id="cts-clock" class="lcd-clock mono" style="color:'+(overTarget?"#f2b45a":"var(--lcd-fg)")+'">'+fmtClock(stepMs())+'</div>'
-    + (cur && cur.target ? ('<div class="lcd-sub mono">Target '+cur.target.toFixed(1)+'s</div>') : '<div class="lcd-sub"></div>')
-    + '</div>'
-    + '<div class="row">'+controls+'</div>'
-    + lastReading + hint
+    + (steps.length ? rows : '<div class="card" style="font-size:12.5px;opacity:.55">No steps yet — click "Add step" or set them up in Models &amp; Steps.</div>')
     + '</div>';
+
+  var hint = '<div style="font-size:11.5px;opacity:.55">Each station is its own stopwatch — start several at once, they run independently. Click a step name to rename it (only while it\'s stopped). Pause/discard controls appear once a station is running.</div>';
+
+  var mid = '<div style="display:flex;flex-direction:column;gap:12px">' + lastReading + stepsBlock + hint + '</div>';
 
   var manualStepOptions = steps.map(function(s){
     return '<option value="'+s.id+'">'+esc(s.station)+' · '+esc(s.name)+'</option>';
@@ -1068,7 +1149,7 @@ function renderTimerTab(){
     return '<div style="display:flex;justify-content:space-between;align-items:center;font-size:12.5px;padding:6px 0;border-bottom:1px solid var(--line)">'
       + '<div style="min-width:0"><div style="font-weight:500">'+esc(r.station)+' · '+esc(r.stepName)+'</div><div style="opacity:.55;font-size:11px">'+esc(r.modelName)+'</div></div>'
       + '<div class="mono" style="font-weight:600;color:'+(over?"var(--red)":"var(--teal-dark)")+'">'+fmtSec(r.duration)+'</div></div>';
-  }).join("") : '<div style="font-size:12.5px;opacity:.55">Nothing recorded yet — start a cycle to see readings here.</div>';
+  }).join("") : '<div style="font-size:12.5px;opacity:.55">Nothing recorded yet — start a station above to see readings here.</div>';
 
   var right =
     '<div style="display:flex;flex-direction:column;gap:14px">'
@@ -1082,7 +1163,7 @@ function renderTimerTab(){
     + '<div class="card" style="flex:1;min-height:180px"><div style="font-size:13px;font-weight:600;margin-bottom:10px">Recent readings</div>'+recentHtml+'</div>'
     + '</div>';
 
-  return '<div class="grid-timer-3">'+stepsPane+mid+right+'</div>';
+  return '<div class="grid-timer-3">'+left+mid+right+'</div>';
 }
 
 /* ---------------- Models tab ---------------- */
@@ -1120,6 +1201,7 @@ function renderModelsTab(){
     var stepItems = "";
     var lastStage = null;
     sel.steps.forEach(function(s,i){
+      stepItems += buildInsertGap("modelsInsertStepAt", i);
       var stg = s.stage || "";
       if (stg !== lastStage){
         stepItems += '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;opacity:.45;padding:8px 6px 2px">'+(stg?esc(stg):"No stage")+'</div>';
@@ -1129,10 +1211,13 @@ function renderModelsTab(){
       stepItems += '<button class="model-list-btn" data-active="'+(active?"1":"0")+'" onclick="modelsSelectStep(\''+s.id+'\')">'
         + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(i+1)+'. '+esc(s.station)+' · '+esc(s.name)+'</span></button>';
     });
+    if (sel.steps.length) stepItems += buildInsertGap("modelsInsertStepAt", sel.steps.length);
     stepsPane = '<div class="card" style="display:flex;flex-direction:column;gap:4px;height:fit-content;max-height:540px;overflow-y:auto">'
       + '<div class="row" style="justify-content:space-between;padding:0 2px 4px">'
       + '<div style="font-size:12px;font-weight:600;opacity:.7;text-transform:uppercase;letter-spacing:.04em">Steps ('+sel.steps.length+')</div>'
       + '<button class="btn-link" style="text-decoration:none;font-size:15px" onclick="addStep()">'+ICO.plus+'</button></div>'
+      + '<div class="row" style="gap:6px;padding:0 2px 6px"><label class="field-label" style="white-space:nowrap">Default reps for new steps</label>'
+      + '<input type="number" min="1" step="1" value="'+(sel.targetSamples||5)+'" onchange="updateModelField(\''+sel.id+'\',\'targetSamples\',Math.max(1,parseInt(this.value,10)||1))" style="width:56px" /></div>'
       + (sel.steps.length ? stepItems : '<div style="font-size:12.5px;opacity:.55;padding:6px 2px">No steps yet.</div>')
       + '</div>';
 
@@ -1152,6 +1237,7 @@ function renderModelsTab(){
         + '<div><label class="field-label">Station</label><br/><input type="text" value="'+esc(selStep.station)+'" onchange="updateStepField(\''+selStep.id+'\',\'station\',this.value)" style="width:100%;margin-top:4px" /></div>'
         + '<div><label class="field-label">Step name</label><br/><input type="text" value="'+esc(selStep.name)+'" onchange="updateStepField(\''+selStep.id+'\',\'name\',this.value)" style="width:100%;margin-top:4px" /></div>'
         + '<div><label class="field-label">Target (s)</label><br/><input type="number" min="0" step="0.1" value="'+(selStep.target!=null?selStep.target:"")+'" onchange="updateStepField(\''+selStep.id+'\',\'target\',this.value)" style="width:140px;margin-top:4px" /></div>'
+        + '<div><label class="field-label">Reps needed</label><br/><input type="number" min="1" step="1" value="'+(getStepReps(selStep, sel))+'" onchange="updateStepField(\''+selStep.id+'\',\'reps\',this.value)" style="width:140px;margin-top:4px" /></div>'
         + '<div class="row" style="margin-top:4px">'
         + '<button class="btn btn-outline" '+(idx===0?"disabled":"")+' onclick="moveStep('+idx+',-1)">'+ICO.up+' Move up</button>'
         + '<button class="btn btn-outline" '+(idx===sel.steps.length-1?"disabled":"")+' onclick="moveStep('+idx+',1)">'+ICO.down+' Move down</button>'
@@ -1269,7 +1355,7 @@ function renderReportTab(){
 /* ---------------------------------------------------------------------- */
 function wireAfterRender(){
   if (state.tab === "timer"){
-    if (state.timerOn && !state.paused) startTick();
+    if (anyTimerRunning()) startTick();
     else clearTick();
   } else {
     clearTick();
